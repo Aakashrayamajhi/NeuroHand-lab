@@ -23,7 +23,7 @@
     minTrackingConfidence: 0.7,
     clickDebounceMs: 900,
     smoothingFactor: 0.35,
-    scrollSpeed: 35,
+    scrollSpeed: 50,
     scrollZoneThreshold: 0.15,
     neutralZone: 0.4,
     cameraWidth: 640,
@@ -43,7 +43,10 @@
     smoothingEnabled: true,
     lastGesture: null,
     gestureStartTime: 0,
-    gestureHoldMs: 150,
+    gestureHoldMs: 100,
+    stableGesture: null,
+    stableFrames: 0,
+    stableThreshold: 3,
     cursorVisible: false,
     cursorEnabled: true,
     targetX: 0,
@@ -52,6 +55,8 @@
     currentY: 0,
     cursorRAF: null,
     isHandPresent: false,
+    cameraReady: false,
+    cameraError: null,
   };
 
   // =====================
@@ -71,14 +76,46 @@
     if (gestureCursor) return gestureCursor;
     gestureCursor = document.createElement("div");
     gestureCursor.id = "gestureCursor";
+    gestureCursor.classList.add("gesture-cursor");
     gestureCursor.setAttribute("aria-hidden", "true");
     document.body.appendChild(gestureCursor);
     return gestureCursor;
   }
 
   // =====================
-  // Helper: Check if finger is extended
+  // Helper: Create error banner
   // =====================
+  function showCameraError(message) {
+    removeCameraError();
+    const banner = document.createElement("div");
+    banner.id = "gestureCameraError";
+    banner.setAttribute("role", "alert");
+    banner.style.cssText =
+      "position: fixed; top: 100px; left: 50%; transform: translateX(-50%); z-index: 10003; max-width: 420px; width: calc(100% - 40px); padding: 18px 20px; border-radius: 14px; background: rgba(15,23,42,0.95); border: 1px solid rgba(244,63,94,0.35); color: #f1f5f9; font-family: inherit; font-size: 14px; line-height: 1.5; backdrop-filter: blur(12px); box-shadow: 0 20px 40px rgba(0,0,0,0.45); text-align: center;";
+    banner.innerHTML =
+      '<div style="font-weight:700; margin-bottom:6px; color:#f97316;">Camera Unavailable</div>' +
+      '<div style="font-size:13px; color:#cbd5e1; margin-bottom:12px;">' + escapeHtml(message) + "</div>" +
+      '<button id="gestureRetryBtn" style="padding:10px 20px; border-radius:10px; border:1px solid rgba(56,189,248,0.4); background:rgba(56,189,248,0.1); color:#38bdf8; font-weight:600; font-size:13px; cursor:pointer; transition:all 0.2s;">Retry Camera</button>' +
+      '<script>' +
+      'document.getElementById("gestureRetryBtn").addEventListener("click", function(){' +
+      '  if (window.__gestureRetry) window.__gestureRetry();' +
+      '});' +
+      '</script>';
+
+    document.body.appendChild(banner);
+  }
+
+  function removeCameraError() {
+    const existing = document.getElementById("gestureCameraError");
+    if (existing) existing.remove();
+  }
+
+  function escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
   function isFingerUp(landmarks, tipIdx, pipIdx) {
     return landmarks[tipIdx].y < landmarks[pipIdx].y;
   }
@@ -92,14 +129,17 @@
     const ringUp = isFingerUp(landmarks, 16, 14);
     const pinkyUp = isFingerUp(landmarks, 20, 18);
 
+    if (indexUp && !middleUp && !ringUp && !pinkyUp) {
+      return "click";
+    }
     if (indexUp && middleUp && ringUp && !pinkyUp) {
       return "scroll-h";
     }
     if (indexUp && middleUp && !ringUp && !pinkyUp) {
       return "scroll";
     }
-    if (indexUp && !middleUp && !ringUp && !pinkyUp) {
-      return "click";
+    if (indexUp && middleUp) {
+      return "scroll";
     }
     return "idle";
   }
@@ -264,7 +304,7 @@
   // =====================
   function handleScroll(landmarks) {
     const rawY = landmarks[8].y;
-    const y = smoothY(rawY);
+    const y = rawY;
 
     const topZone = CONFIG.neutralZone - CONFIG.scrollZoneThreshold;
     const bottomZone = CONFIG.neutralZone + CONFIG.scrollZoneThreshold;
@@ -272,11 +312,11 @@
     if (y < topZone) {
       const intensity = 1 - y / topZone;
       const scrollAmount = CONFIG.scrollSpeed * (0.5 + intensity * 0.5);
-      window.scrollBy({ top: -scrollAmount, behavior: "smooth" });
+      window.scrollBy({ top: -scrollAmount, behavior: "auto" });
     } else if (y > bottomZone) {
       const intensity = (y - bottomZone) / (1 - bottomZone);
       const scrollAmount = CONFIG.scrollSpeed * (0.5 + intensity * 0.5);
-      window.scrollBy({ top: scrollAmount, behavior: "smooth" });
+      window.scrollBy({ top: scrollAmount, behavior: "auto" });
     }
 
     const rawX = landmarks[8].x * window.innerWidth;
@@ -296,11 +336,11 @@
     if (rawX < leftZone) {
       const intensity = 1 - rawX / leftZone;
       const scrollAmount = CONFIG.scrollSpeed * (0.5 + intensity * 0.5);
-      window.scrollBy({ left: -scrollAmount, behavior: "smooth" });
+      window.scrollBy({ left: -scrollAmount, behavior: "auto" });
     } else if (rawX > rightZone) {
       const intensity = (rawX - rightZone) / (1 - rightZone);
       const scrollAmount = CONFIG.scrollSpeed * (0.5 + intensity * 0.5);
-      window.scrollBy({ left: scrollAmount, behavior: "smooth" });
+      window.scrollBy({ left: scrollAmount, behavior: "auto" });
     }
 
     const rawXPos = landmarks[8].x * window.innerWidth;
@@ -317,7 +357,9 @@
     state.smoothX = null;
     state.smoothY = null;
     state.isHandPresent = false;
-    hideCursor();
+    if (state.cameraReady) {
+      hideCursor();
+    }
     if (debugPointer) debugPointer.style.display = "none";
   }
 
@@ -330,6 +372,8 @@
         handleIdle();
         setStatus("No hand detected", false);
         state.isHandPresent = false;
+        state.stableGesture = null;
+        state.stableFrames = 0;
       }
       return;
     }
@@ -339,46 +383,56 @@
     const gesture = detectGesture(landmarks);
     const now = Date.now();
 
-    // Gesture stability check
     if (state.lastGesture === gesture) {
-      if (now - state.gestureStartTime < state.gestureHoldMs) {
-        const rawX = landmarks[8].x * window.innerWidth;
-        const rawY = landmarks[8].y * window.innerHeight;
-        setCursorTarget(rawX, rawY);
-        return;
-      }
+      state.stableFrames++;
     } else {
       state.lastGesture = gesture;
-      state.gestureStartTime = now;
-      const rawX = landmarks[8].x * window.innerWidth;
-      const rawY = landmarks[8].y * window.innerHeight;
-      setCursorTarget(rawX, rawY);
+      state.stableFrames = 1;
+    }
+
+    const isStable = gesture !== "idle" && state.stableFrames >= state.stableThreshold;
+
+    const rawX = landmarks[8].x * window.innerWidth;
+    const rawY = landmarks[8].y * window.innerHeight;
+    setCursorTarget(rawX, rawY);
+
+    if (gesture === "idle") {
+      setStatus("Hand detected - Idle", true);
+      handleIdle();
+      state.isHandPresent = true;
       return;
     }
 
     switch (gesture) {
-      case "click":
+      case "click": {
+        if (!isStable) {
+          setStatus("Click Mode - stabilizing...", true);
+          return;
+        }
         setStatus("Click Mode", true);
         handleClick(landmarks);
         break;
-      case "scroll":
+      }
+      case "scroll": {
+        if (!isStable) {
+          setStatus("Scroll Mode - stabilizing...", true);
+          return;
+        }
         setStatus("Scroll Mode", true);
         state.isScrolling = true;
         handleScroll(landmarks);
         break;
-      case "scroll-h":
+      }
+      case "scroll-h": {
+        if (!isStable) {
+          setStatus("Horizontal Scroll Mode - stabilizing...", true);
+          return;
+        }
         setStatus("Horizontal Scroll Mode", true);
         state.isScrolling = true;
         handleScrollH(landmarks);
         break;
-      default:
-        setStatus("Hand detected - Idle", true);
-        handleIdle();
-        state.isHandPresent = true;
-        const rawX = landmarks[8].x * window.innerWidth;
-        const rawY = landmarks[8].y * window.innerHeight;
-        setCursorTarget(rawX, rawY);
-        break;
+      }
     }
   }
 
@@ -410,31 +464,78 @@
   // Initialize Camera
   // =====================
   async function initCamera(hands) {
+    state.cameraError = null;
     console.log("[Gesture] Requesting camera access...");
 
-    const camera = new window.Camera(videoEl, {
-      onFrame: async () => {
-        await hands.send({ image: videoEl });
-      },
-      width: CONFIG.cameraWidth,
-      height: CONFIG.cameraHeight,
-    });
-
     try {
-      await camera.start();
-      console.log("[Gesture] Camera started successfully");
-      setStatus("Camera Active", true);
-      return true;
-    } catch (err) {
-      console.error("[Gesture] Camera error:", err);
-      setStatus("Camera Access Denied", false);
-      alert(
-        "Camera access is required for gesture control.\n\n" +
-        "Please allow camera permissions and reload the page.\n\n" +
-        "Error: " + err.message
-      );
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      stream.getTracks().forEach(track => track.stop());
+    } catch (permErr) {
+      const friendly = getCameraPermissionMessage(permErr);
+      console.warn("[Gesture] Camera permission check failed:", friendly);
+      setStatus("Camera Permission Required", false);
+      showCameraError(friendly);
       return false;
     }
+
+    try {
+      const camera = new window.Camera(videoEl, {
+        onFrame: async () => {
+          if (hands && state.cameraReady) {
+            await hands.send({ image: videoEl });
+          }
+        },
+        width: CONFIG.cameraWidth,
+        height: CONFIG.cameraHeight,
+      });
+
+      await camera.start();
+      state.cameraReady = true;
+      console.log("[Gesture] Camera started successfully");
+      setStatus("Camera Active", true);
+      removeCameraError();
+      return true;
+    } catch (err) {
+      state.cameraReady = false;
+      const msg = err && err.message ? err.message : String(err);
+      state.cameraError = msg;
+      console.error("[Gesture] Camera error:", err);
+      const friendly = getCameraDeviceErrorMessage(msg);
+      setStatus("Camera Unavailable", false);
+      showCameraError(friendly);
+      hideCursor();
+      if (debugPointer) debugPointer.style.display = "none";
+      return false;
+    }
+  }
+
+  function getCameraPermissionMessage(err) {
+    const name = err && err.name ? err.name.toLowerCase() : "";
+    const msg = err && err.message ? err.message.toLowerCase() : "";
+    if (name.includes("notallowed") || name.includes("permission") || msg.includes("permission")) {
+      return "Camera permission was denied. Click the lock/camera icon in your browser's address bar, then allow camera access and reload the page.";
+    }
+    if (name.includes("notfound") || msg.includes("not found")) {
+      return "No camera device found. Connect a webcam and reload the page.";
+    }
+    if (name.includes("notreadable") || msg.includes("could not start")) {
+      return "Camera is already in use by another app. Close other apps using the camera and reload.";
+    }
+    return "Camera access is required for gesture control. Allow camera permission in your browser settings and reload the page.";
+  }
+
+  function getCameraDeviceErrorMessage(msg) {
+    const lower = String(msg).toLowerCase();
+    if (lower.includes("notfound") || lower.includes("not found")) {
+      return "No camera device detected. Connect a camera and reload.";
+    }
+    if (lower.includes("notallowederror") || lower.includes("notallowederror") || lower.includes("permission")) {
+      return "Camera permission denied. Allow camera in browser settings and reload.";
+    }
+    if (lower.includes("notreadable") || lower.includes("could not start")) {
+      return "Camera is already in use by another application.";
+    }
+    return "Unable to access camera. Check device, permissions, and reload.";
   }
 
   // =====================
@@ -520,9 +621,8 @@
     if (typeof window.Hands === "undefined" || typeof window.Camera === "undefined") {
       console.error("[Gesture] MediaPipe scripts not loaded. Check network.");
       setStatus("MediaPipe Load Error", false);
-      alert(
-        "MediaPipe libraries failed to load.\n\n" +
-        "Please check your internet connection and reload the page."
+      showCameraError(
+        "MediaPipe libraries failed to load. Check your internet connection and reload."
       );
       return;
     }
@@ -532,18 +632,29 @@
 
     if (cameraReady) {
       console.log("[Gesture] System ready. Show your hand to the camera.");
-      console.log("[Gesture] Gestures: [1 finger] Click, [2 fingers] Scroll, [3 fingers] Horizontal Scroll");
+      console.log(
+        "[Gesture] Gestures: [1 finger] Click, [2 fingers] Scroll, [3 fingers] Horizontal Scroll"
+      );
     }
+  }
+
+  function registerRetry() {
+    window.__gestureRetry = async () => {
+      removeCameraError();
+      await init();
+    };
   }
 
   // Start when DOM is ready
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => {
       attachSettingsListeners();
+      registerRetry();
       init();
     });
   } else {
     attachSettingsListeners();
+    registerRetry();
     init();
   }
 
